@@ -2,7 +2,6 @@ import os
 import re
 import time
 import html
-import shutil
 import sqlite3
 import logging
 import threading
@@ -212,35 +211,18 @@ def start(message):
     )
 
 def get_status_text():
-    # Render Server Disk Storage
-    total, used, free = shutil.disk_usage("/")
-    total_mb = total / (2**20)
-    used_mb = used / (2**20)
-    free_mb = free / (2**20)
-    used_percent = (used / total) * 100 if total > 0 else 0
-
-    # SQLite Database File Size (Users + Data)
+    # SQLite Database File Size
     db_size_kb = 0
     if os.path.exists(DB_PATH):
         db_size_kb = os.path.getsize(DB_PATH) / 1024
 
-    with state_lock:
-        total_sources = sum(len(v) for v in sources.values())
-        total_dests = sum(len(v) for v in destinations.values())
-        total_users = len(get_all_users())
+    total_users = len(get_all_users())
 
     return (
-        "📊 <b>Render Server & Bot Status</b>\n\n"
-        f"💾 <b>Render Disk Storage:</b>\n"
-        f"• Total: <code>{total_mb:.2f} MB ({total_mb/1024:.2f} GB)</code>\n"
-        f"• Used: <code>{used_mb:.2f} MB ({used_percent:.1f}%)</code>\n"
-        f"• Free: <code>{free_mb:.2f} MB ({free_mb/1024:.2f} GB)</code>\n\n"
         f"🗂 <b>Bot Database File Size (Users Storage):</b>\n"
-        f"• <code>{db_size_kb:.2f} KB ({db_size_kb/1024:.2f} MB)</code>\n\n"
+        f"• <code>{db_size_kb:.2f} KB</code>\n\n"
         f"👥 <b>Stats:</b>\n"
-        f"• Total Users: <code>{total_users}</code>\n"
-        f"• Active Source IDs: <code>{total_sources}</code>\n"
-        f"• Active Forward IDs: <code>{total_dests}</code>"
+        f"• Total Users: <code>{total_users}</code>"
     )
 
 @bot.message_handler(commands=["status"])
@@ -442,7 +424,8 @@ def process_id_action(message, action):
             f"• <code>{html.escape(x)}</code>" for x in failed
         ]
     safe_reply_to(message, "\n".join(lines), parse_mode="HTML")
-    # =============== MEDIA / ALBUM HANDLING ===============
+
+# =============== MEDIA / ALBUM HANDLING ===============
 CONTENT_TYPES = [
     "text", "photo", "video", "document", "audio",
     "animation", "voice", "video_note", "sticker",
