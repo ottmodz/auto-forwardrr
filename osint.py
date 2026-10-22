@@ -30,20 +30,31 @@ ADD_CHANNEL_URL = (
 if not BOT_TOKEN:
     raise RuntimeError("Set BOT_TOKEN in Render Environment Variables.")
 
-logging.basicConfig(level=logging.WARNING)
+db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+os.makedirs(db_dir, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=8)
 
-# Channel settings are RAM-only and reset after restart.
+state_lock = threading.RLock()
+
+# Runtime cache; SQLite is the persistent source of truth.
 sources = {}
 destinations = {}
 pending = {}
-state_lock = threading.RLock()
 
-# =============== USER DATABASE ===============
+# =============== DATABASE ===============
 def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=20)
-    conn.execute("PRAGMA busy_timeout=20000")
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
 
 def init_db():
     conn = get_db()
@@ -55,9 +66,73 @@ def init_db():
                 joined_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_settings (
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('source', 'destination')),
+                title TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, chat_id, kind)
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_settings_kind_chat
+            ON channel_settings(kind, chat_id)
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                user_id INTEGER PRIMARY KEY,
+                action TEXT NOT NULL
+            )
+        """)
+
         conn.commit()
     finally:
         conn.close()
+
+    load_settings()
+
+
+def load_settings():
+    loaded_sources = defaultdict(dict)
+    loaded_destinations = defaultdict(dict)
+    loaded_pending = {}
+
+    conn = get_db()
+    try:
+        for user_id, chat_id, kind, title in conn.execute(
+            "SELECT user_id, chat_id, kind, title FROM channel_settings"
+        ):
+            if kind == "source":
+                loaded_sources[user_id][chat_id] = title
+            else:
+                loaded_destinations[user_id][chat_id] = title
+
+        for user_id, action in conn.execute(
+            "SELECT user_id, action FROM pending_actions"
+        ):
+            loaded_pending[user_id] = action
+    finally:
+        conn.close()
+
+    with state_lock:
+        sources.clear()
+        destinations.clear()
+        pending.clear()
+
+        sources.update(dict(loaded_sources))
+        destinations.update(dict(loaded_destinations))
+        pending.update(loaded_pending)
+
+    logging.info(
+        "Settings loaded: %s source owners, %s destination owners",
+        len(sources), len(destinations)
+    )
+
 
 def save_user(user):
     conn = get_db()
@@ -66,21 +141,52 @@ def save_user(user):
             INSERT INTO users(user_id, first_name)
             VALUES (?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
-            first_name=excluded.first_name
+                first_name=excluded.first_name
         """, (user.id, user.first_name or "User"))
         conn.commit()
     finally:
         conn.close()
 
+
 def get_all_users():
     conn = get_db()
     try:
         return [
-            r[0] for r in
-            conn.execute("SELECT user_id FROM users").fetchall()
+            row[0]
+            for row in conn.execute(
+                "SELECT user_id FROM users"
+            ).fetchall()
         ]
     finally:
         conn.close()
+
+
+def save_channel(user_id, chat_id, kind, title):
+    conn = get_db()
+    try:
+        conn.execute("""
+            INSERT INTO channel_settings(user_id, chat_id, kind, title)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, chat_id, kind)
+            DO UPDATE SET title=excluded.title
+        """, (user_id, chat_id, kind, title or str(chat_id)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_channel(user_id, chat_id, kind):
+    conn = get_db()
+    try:
+        cur = conn.execute("""
+            DELETE FROM channel_settings
+            WHERE user_id=? AND chat_id=? AND kind=?
+        """, (user_id, chat_id, kind))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
 
 # =============== CHANNEL HELPERS ===============
 def get_chats(table, user_id):
@@ -88,42 +194,97 @@ def get_chats(table, user_id):
     with state_lock:
         return list(store.get(user_id, {}).items())
 
+
 def remove_chat(table, user_id, chat_id):
-    store = sources if table == "sources" else destinations
+    kind = "source" if table == "sources" else "destination"
+
     with state_lock:
-        return store.get(user_id, {}).pop(chat_id, None) is not None
+        store = sources if kind == "source" else destinations
+
+        if chat_id not in store.get(user_id, {}):
+            return False
+
+        # Persist the deletion before updating the cache.
+        if not delete_channel(user_id, chat_id, kind):
+            return False
+
+        store[user_id].pop(chat_id, None)
+        if not store[user_id]:
+            store.pop(user_id, None)
+
+        return True
+
 
 def set_pending(user_id, action):
+    conn = get_db()
+    try:
+        conn.execute("""
+            INSERT INTO pending_actions(user_id, action)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET action=excluded.action
+        """, (user_id, action))
+        conn.commit()
+    finally:
+        conn.close()
+
     with state_lock:
         pending[user_id] = action
+
 
 def get_pending(user_id):
     with state_lock:
         return pending.get(user_id)
 
+
 def clear_pending(user_id):
+    conn = get_db()
+    try:
+        conn.execute(
+            "DELETE FROM pending_actions WHERE user_id=?",
+            (user_id,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
     with state_lock:
         pending.pop(user_id, None)
 
+
 def is_id_registered(chat_id):
+    # An ID is registered if ANY user has it as source or destination.
     with state_lock:
         return (
-            any(chat_id in x for x in sources.values())
-            or any(chat_id in x for x in destinations.values())
+            any(chat_id in chats for chats in sources.values())
+            or any(chat_id in chats for chats in destinations.values())
         )
 
+
 def add_source(user_id, chat_id, title):
-    # Source IDs can be reused by different users.
+    # Source IDs may be reused by any number of users.
+    title = title or str(chat_id)
+
     with state_lock:
-        sources.setdefault(user_id, {})[chat_id] = title or str(chat_id)
+        save_channel(user_id, chat_id, "source", title)
+        sources.setdefault(user_id, {})[chat_id] = title
+
 
 def add_destination(user_id, chat_id, title):
-    # IDs already registered anywhere cannot be added as destinations.
+    # A destination ID must not already exist as ANY source/destination.
+    # Check and insert while holding the same lock.
+    title = title or str(chat_id)
+
     with state_lock:
-        if is_id_registered(chat_id):
+        if (
+            any(chat_id in chats for chats in sources.values())
+            or any(chat_id in chats for chats in destinations.values())
+        ):
             return False
-        destinations.setdefault(user_id, {})[chat_id] = title or str(chat_id)
+
+        save_channel(user_id, chat_id, "destination", title)
+        destinations.setdefault(user_id, {})[chat_id] = title
         return True
+
 
 # =============== MENUS ===============
 def main_menu(user_id):
@@ -134,39 +295,37 @@ def main_menu(user_id):
         InlineKeyboardButton("⚙️ Manage Channels", callback_data="manage"),
         InlineKeyboardButton("📋 My Channel List", callback_data="mylist"),
     )
+
     if user_id == ADMIN_ID:
         kb.add(
             InlineKeyboardButton(
                 "📣 Admin Broadcast", callback_data="broadcast"
             )
         )
+
     return kb
+
 
 def manage_menu():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
-        InlineKeyboardButton(
-            "➕ Add Source Channel ID", callback_data="source_add"
-        ),
-        InlineKeyboardButton(
-            "➕ Add Forward Channel ID", callback_data="dest_add"
-        ),
-        InlineKeyboardButton(
-            "🗑 Delete Source Channel ID", callback_data="source_remove"
-        ),
-        InlineKeyboardButton(
-            "🗑 Delete Forward Channel ID", callback_data="dest_remove"
-        ),
+        InlineKeyboardButton("➕ Add Source Channel ID", callback_data="source_add"),
+        InlineKeyboardButton("➕ Add Forward Channel ID", callback_data="dest_add"),
+        InlineKeyboardButton("🗑 Delete Source Channel ID", callback_data="source_remove"),
+        InlineKeyboardButton("🗑 Delete Forward Channel ID", callback_data="dest_remove"),
         InlineKeyboardButton("⬅️ Main Menu", callback_data="home"),
     )
     return kb
+
 
 # =============== START / CANCEL ===============
 @bot.message_handler(commands=["start"])
 def start(message):
     if not message.from_user:
         return
+
     save_user(message.from_user)
+
     bot.send_message(
         message.chat.id,
         "🤖 <b>Multi-User Auto Forward Bot</b>\n\n"
@@ -174,34 +333,43 @@ def start(message):
         "📤 Add Forward Channel — send copied posts to a destination.\n\n"
         "Use <b>Manage Channels</b> to add or remove channel IDs.\n"
         "Send multiple IDs separated by spaces or new lines.\n\n"
-        "⚠️ Channel settings reset after a bot restart.",
+        "💾 Channel settings are stored in the database.",
         reply_markup=main_menu(message.from_user.id),
         parse_mode="HTML",
     )
 
+
 @bot.message_handler(commands=["cancel"])
 def cancel(message):
-    clear_pending(message.from_user.id)
+    if message.from_user:
+        clear_pending(message.from_user.id)
     bot.reply_to(message, "❎ Cancelled.")
+
 
 def channel_list_text(user_id):
     src = get_chats("sources", user_id)
     dst = get_chats("destinations", user_id)
+
     lines = [
         "📋 <b>Your Channel Settings</b>",
         "",
         "📥 <b>Source Channels</b>",
     ]
+
     lines += [
         f"• {html.escape(title)} — <code>{cid}</code>"
         for cid, title in src
     ] or ["• None"]
+
     lines += ["", "📤 <b>Forward Channels</b>"]
+
     lines += [
         f"• {html.escape(title)} — <code>{cid}</code>"
         for cid, title in dst
     ] or ["• None"]
+
     return "\n".join(lines)
+
 
 # =============== CALLBACKS ===============
 @bot.callback_query_handler(func=lambda call: True)
@@ -238,21 +406,20 @@ def callback_handler(call):
     ):
         bot.answer_callback_query(call.id)
         set_pending(uid, data)
+
         prompts = {
             "source_add":
                 "➕ <b>Add Source Channel ID</b>\n\n"
-                "Send one or more source channel IDs. "
-                "The bot must be an administrator in each source.\n\n"
+                "Send source IDs. The bot must be an administrator "
+                "in each source.\n\n"
                 "Example:\n<code>-1004480271980\n-1005880271980</code>\n\n"
-                "Separate IDs with spaces or new lines. Cancel: /cancel",
+                "Cancel: /cancel",
 
             "dest_add":
                 "➕ <b>Add Forward Channel ID</b>\n\n"
-                "Send one or more destination channel IDs. "
-                "The bot must have posting permission.\n\n"
-                "Example:\n<code>-1004480271980\n-1005880271980</code>\n\n"
-                "An ID already registered as a source or destination "
-                "cannot be added as a destination. Cancel: /cancel",
+                "Send destination IDs. The bot must have posting permission.\n\n"
+                "An ID already registered as ANY source or destination "
+                "cannot be added as a destination.\n\nCancel: /cancel",
 
             "source_remove":
                 "🗑 <b>Delete Source Channel ID</b>\n\n"
@@ -262,6 +429,7 @@ def callback_handler(call):
                 "🗑 <b>Delete Forward Channel ID</b>\n\n"
                 "Send IDs separated by spaces or new lines. Cancel: /cancel",
         }
+
         bot.send_message(
             call.message.chat.id, prompts[data], parse_mode="HTML"
         )
@@ -269,15 +437,16 @@ def callback_handler(call):
 
     if data == "broadcast":
         bot.answer_callback_query(call.id)
+
         if uid != ADMIN_ID:
             bot.send_message(call.message.chat.id, "⛔ Unauthorized.")
             return
+
         set_pending(uid, "broadcast")
         bot.send_message(
             call.message.chat.id,
             "📣 <b>Admin Broadcast</b>\n\n"
-            "Send text, photo, video, document, or supported media.\n"
-            "It will be copied to registered users and configured "
+            "Send a message to copy to registered users and configured "
             "destination chats.\n\nCancel: /cancel",
             parse_mode="HTML",
         )
@@ -285,14 +454,21 @@ def callback_handler(call):
 
     bot.answer_callback_query(call.id, "Unknown option")
 
-# =============== ID PARSER ===============
+
+# =============== ID PARSER / PERMISSIONS ===============
 def parse_chat_ids(text):
     parts = [
-        p for p in re.split(r"[\s,]+", (text or "").strip()) if p
+        part for part in re.split(r"[\s,]+", (text or "").strip())
+        if part
     ]
-    if not parts or any(not re.fullmatch(r"-?\d+", p) for p in parts):
+
+    if not parts or any(
+        not re.fullmatch(r"-?\d+", part) for part in parts
+    ):
         return None
-    return list(dict.fromkeys(int(p) for p in parts))
+
+    return list(dict.fromkeys(int(part) for part in parts))
+
 
 def verify_chat(chat_id, action):
     chat = bot.get_chat(chat_id)
@@ -301,14 +477,19 @@ def verify_chat(chat_id, action):
     if action == "source_add":
         if member.status not in ("administrator", "creator"):
             raise ValueError("Bot must be admin in source.")
+
     elif chat.type == "channel":
         if member.status not in ("administrator", "creator"):
             raise ValueError("Bot must be admin in destination.")
+
         if getattr(member, "can_post_messages", None) is False:
             raise ValueError("Bot cannot post to destination.")
+
     elif member.status not in ("administrator", "creator", "member"):
         raise ValueError("Bot cannot post to this chat.")
+
     return chat
+
 
 def process_id_action(message, action):
     uid = message.from_user.id
@@ -318,54 +499,77 @@ def process_id_action(message, action):
         bot.reply_to(
             message,
             "❌ Invalid format. Send numeric channel IDs separated by "
-            "spaces or new lines.\n\nExample:\n"
-            "<code>-1004480271980\n-1005880271980</code>",
+            "spaces or new lines.\n\n"
+            "Example:\n<code>-1004480271980\n-1005880271980</code>",
             parse_mode="HTML",
         )
         return
 
     added, skipped, failed = [], [], []
+
     for chat_id in ids:
         if action in ("source_add", "dest_add"):
             try:
                 chat = verify_chat(chat_id, action)
                 title = getattr(chat, "title", None) or str(chat_id)
+
                 if action == "source_add":
+                    # Always allow adding an ID as source.
                     add_source(uid, chat_id, title)
                     added.append(f"{chat_id} — Source")
+
                 elif add_destination(uid, chat_id, title):
                     added.append(f"{chat_id} — Forward")
+
                 else:
                     skipped.append(
                         f"{chat_id} — Already registered; cannot add as Forward"
                     )
+
             except Exception:
-                logging.warning("Verification failed for %s", chat_id,
-                                exc_info=True)
-                failed.append(f"{chat_id} — Verification/permission failed")
+                logging.warning(
+                    "Verification failed for chat %s",
+                    chat_id, exc_info=True
+                )
+                failed.append(
+                    f"{chat_id} — Verification/permission failed"
+                )
+
         else:
-            table = "sources" if action == "source_remove" else "destinations"
+            table = (
+                "sources" if action == "source_remove"
+                else "destinations"
+            )
+
             if remove_chat(table, uid, chat_id):
                 skipped.append(f"{chat_id} — Deleted")
             else:
                 skipped.append(f"{chat_id} — Not found in your list")
 
     clear_pending(uid)
+
     lines = ["📋 <b>Channel ID Results</b>", ""]
+
     if added:
         lines += ["✅ <b>Added:</b>"] + [
-            f"• <code>{html.escape(x)}</code>" for x in added
+            f"• <code>{html.escape(item)}</code>"
+            for item in added
         ]
+
     if skipped:
         lines += ["", "ℹ️ <b>Skipped / Removed:</b>"] + [
-            f"• <code>{html.escape(x)}</code>" for x in skipped
+            f"• <code>{html.escape(item)}</code>"
+            for item in skipped
         ]
+
     if failed:
         lines += ["", "❌ <b>Failed:</b>"] + [
-            f"• <code>{html.escape(x)}</code>" for x in failed
+            f"• <code>{html.escape(item)}</code>"
+            for item in failed
         ]
+
     bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
-        
+    
 # =============== MEDIA / ALBUM HANDLING ===============
 CONTENT_TYPES = [
     "text", "photo", "video", "document", "audio",
@@ -377,16 +581,22 @@ album_buffer = defaultdict(list)
 album_timers = {}
 album_lock = threading.Lock()
 
+
 def media_kind(message):
     if message.content_type == "photo" and message.photo:
         return "photo", message.photo[-1].file_id
+
     if message.content_type == "video" and message.video:
         return "video", message.video.file_id
+
     if message.content_type == "document" and message.document:
         return "document", message.document.file_id
+
     if message.content_type == "audio" and message.audio:
         return "audio", message.audio.file_id
+
     return None, None
+
 
 def build_media_group(messages):
     messages = sorted(messages, key=lambda m: m.message_id)
@@ -398,23 +608,27 @@ def build_media_group(messages):
         or kind_set == {"document"}
         or kind_set == {"audio"}
     )
+
     if not compatible or not 2 <= len(messages) <= 10:
         return None
 
     caption_message = next(
-        (m for m in messages if getattr(m, "caption", None)), None
+        (m for m in messages if getattr(m, "caption", None)),
+        None
     )
+
     media = []
 
     for msg in messages:
         kind, file_id = media_kind(msg)
+
         if not kind:
             return None
 
         caption = (
             caption_message.caption
-            if caption_message and
-            msg.message_id == caption_message.message_id
+            if caption_message
+            and msg.message_id == caption_message.message_id
             else None
         )
 
@@ -429,13 +643,18 @@ def build_media_group(messages):
 
     return media
 
+
 def get_destinations_for_source(source_id):
+    # Every owner who registered this source receives to their destinations.
     result = set()
+
     with state_lock:
-        for owner_id, chat_map in sources.items():
-            if source_id in chat_map:
+        for owner_id, source_map in sources.items():
+            if source_id in source_map:
                 result.update(destinations.get(owner_id, {}).keys())
+
     return result
+
 
 def forward_single_to(message, destination_id):
     try:
@@ -446,12 +665,18 @@ def forward_single_to(message, destination_id):
         )
     except Exception:
         logging.warning(
-            "Copy failed to %s", destination_id, exc_info=True
+            "Copy failed: source=%s destination=%s message=%s",
+            message.chat.id, destination_id, message.message_id,
+            exc_info=True
         )
 
+
 def forward_single(message):
-    for destination_id in get_destinations_for_source(message.chat.id):
+    destinations_for_post = get_destinations_for_source(message.chat.id)
+
+    for destination_id in destinations_for_post:
         forward_single_to(message, destination_id)
+
 
 def flush_album(key):
     with album_lock:
@@ -462,42 +687,53 @@ def flush_album(key):
         return
 
     messages.sort(key=lambda m: m.message_id)
+    media = build_media_group(messages)
+
     for destination_id in get_destinations_for_source(messages[0].chat.id):
         try:
-            media = build_media_group(messages)
             if media:
                 bot.send_media_group(
-                    chat_id=destination_id, media=media
+                    chat_id=destination_id,
+                    media=media
                 )
             else:
                 for msg in messages:
                     forward_single_to(msg, destination_id)
+
         except Exception:
             logging.warning(
                 "Album forwarding failed to %s",
                 destination_id, exc_info=True
             )
 
+
 def handle_album(message):
     key = (message.chat.id, message.media_group_id)
+
     with album_lock:
         album_buffer[key].append(message)
+
         old_timer = album_timers.get(key)
         if old_timer:
             old_timer.cancel()
 
-        timer = threading.Timer(1.3, flush_album, args=(key,))
+        timer = threading.Timer(1.5, flush_album, args=(key,))
         timer.daemon = True
         album_timers[key] = timer
         timer.start()
 
+
 # =============== SOURCE CHANNEL POSTS ===============
 @bot.channel_post_handler(content_types=CONTENT_TYPES)
 def handle_channel_post(message):
-    if getattr(message, "media_group_id", None) and media_kind(message)[0]:
+    if (
+        getattr(message, "media_group_id", None)
+        and media_kind(message)[0]
+    ):
         handle_album(message)
     else:
         forward_single(message)
+
 
 # =============== SOURCE GROUP POSTS ===============
 @bot.message_handler(
@@ -513,10 +749,14 @@ def handle_group_post(message):
     ).startswith("/"):
         return
 
-    if getattr(message, "media_group_id", None) and media_kind(message)[0]:
+    if (
+        getattr(message, "media_group_id", None)
+        and media_kind(message)[0]
+    ):
         handle_album(message)
     else:
         forward_single(message)
+
 
 # =============== ADMIN BROADCAST ===============
 def broadcast_message(message):
@@ -527,6 +767,7 @@ def broadcast_message(message):
             targets.update(chat_map.keys())
 
     targets.discard(ADMIN_ID)
+
     sent = 0
     failed = 0
 
@@ -540,6 +781,7 @@ def broadcast_message(message):
             sent += 1
         except Exception:
             failed += 1
+
         time.sleep(0.04)
 
     bot.send_message(
@@ -549,6 +791,7 @@ def broadcast_message(message):
         f"❌ Failed: <code>{failed}</code>",
         parse_mode="HTML"
     )
+
 
 # =============== PRIVATE USER INPUT ===============
 @bot.message_handler(
@@ -560,6 +803,8 @@ def handle_pending(message):
         return
 
     uid = message.from_user.id
+    save_user(message.from_user)
+
     action = get_pending(uid)
 
     if not action:
@@ -574,6 +819,7 @@ def handle_pending(message):
         if uid != ADMIN_ID:
             clear_pending(uid)
             return
+
         clear_pending(uid)
         broadcast_message(message)
         return
@@ -591,6 +837,7 @@ def handle_pending(message):
 
         process_id_action(message, action)
 
+
 # =============== RENDER HEALTH SERVER ===============
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -606,11 +853,14 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+
 def run_health_server():
     server = ThreadingHTTPServer(
-        ("0.0.0.0", PORT), HealthHandler
+        ("0.0.0.0", PORT),
+        HealthHandler
     )
     server.serve_forever()
+
 
 # =============== START BOT ===============
 if __name__ == "__main__":
@@ -621,7 +871,7 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
-    logging.warning("Auto Forward Bot started.")
+    logging.info("Auto Forward Bot started.")
 
     while True:
         try:
@@ -631,5 +881,8 @@ if __name__ == "__main__":
                 long_polling_timeout=30
             )
         except Exception:
-            logging.exception("Polling stopped; restarting in 5 seconds.")
+            logging.exception(
+                "Polling stopped; restarting in 5 seconds."
+            )
             time.sleep(5)
+    
