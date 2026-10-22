@@ -113,12 +113,12 @@ def is_id_registered(chat_id):
         )
 
 def add_source(user_id, chat_id, title):
-    # Source IDs can be reused by different users freely.
+    # Source IDs can be freely reused/added as sources by any user.
     with state_lock:
         sources.setdefault(user_id, {})[chat_id] = title or str(chat_id)
 
 def add_destination(user_id, chat_id, title):
-    # IDs already registered globally (Source or Destination by ANY user) cannot be added as a destination.
+    # Any ID registered globally cannot be added as a destination.
     with state_lock:
         if is_id_registered(chat_id):
             return False
@@ -252,7 +252,7 @@ def callback_handler(call):
                 "The bot must have posting permission.\n\n"
                 "Example:\n<code>-1004480271980\n-1005880271980</code>\n\n"
                 "Any ID already registered globally as a source or destination "
-                "by any user cannot be added as a destination. Cancel: /cancel",
+                "cannot be added as a destination. Cancel: /cancel",
 
             "source_remove":
                 "🗑 <b>Delete Source Channel ID</b>\n\n"
@@ -365,7 +365,7 @@ def process_id_action(message, action):
             f"• <code>{html.escape(x)}</code>" for x in failed
         ]
     bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
-    # =============== MEDIA / ALBUM HANDLING ===============
+        # =============== MEDIA / ALBUM HANDLING ===============
 CONTENT_TYPES = [
     "text", "photo", "video", "document", "audio",
     "animation", "voice", "video_note", "sticker",
@@ -632,4 +632,4 @@ if __name__ == "__main__":
         except Exception:
             logging.exception("Polling stopped; restarting in 5 seconds.")
             time.sleep(5)
-            
+        
