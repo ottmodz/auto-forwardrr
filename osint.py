@@ -84,7 +84,6 @@ def get_all_users():
 
 # =============== AUTO DELETE HELPER ===============
 def safe_send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
-    """Sends a message and automatically deletes it after ~2 minutes (120 seconds)."""
     try:
         sent_msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
         
@@ -102,9 +101,8 @@ def safe_send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
         return None
 
 def safe_reply_to(message, text, reply_markup=None, parse_mode="HTML"):
-    """Replies to a message and automatically deletes the reply after ~2 minutes (120 seconds)."""
     try:
-        sent_msg = bot.reply_to(message, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        sent_msg = bot.reply_to(message, text, reply_markup=reply_markup, parse_mode="HTML")
         
         def delete_later():
             try:
@@ -171,9 +169,8 @@ def main_menu(user_id):
     )
     if user_id == ADMIN_ID:
         kb.add(
-            InlineKeyboardButton(
-                "📣 Admin Broadcast", callback_data="broadcast"
-            )
+            InlineKeyboardButton("📣 Admin Broadcast", callback_data="broadcast"),
+            InlineKeyboardButton("📊 Bot Status & Storage", callback_data="admin_status")
         )
     return kb
 
@@ -214,17 +211,13 @@ def start(message):
         parse_mode="HTML",
     )
 
-@bot.message_handler(commands=["status"])
-def status_command(message):
-    if not message.from_user or message.from_user.id != ADMIN_ID:
-        return
-    
-    # Get Render / Disk Storage statistics
+def get_status_text():
+    # Get Render / Disk Storage statistics in MB / GB
     total, used, free = shutil.disk_usage("/")
     
-    total_gb = total / (2**30)
-    used_gb = used / (2**30)
-    free_gb = free / (2**30)
+    total_mb = total / (2**20)
+    used_mb = used / (2**20)
+    free_mb = free / (2**20)
     used_percent = (used / total) * 100 if total > 0 else 0
 
     with state_lock:
@@ -232,18 +225,23 @@ def status_command(message):
         total_dests = sum(len(v) for v in destinations.values())
         total_users = len(get_all_users())
 
-    status_text = (
+    return (
         "📊 <b>Render Server & Bot Status</b>\n\n"
         f"💾 <b>Disk Storage (Render):</b>\n"
-        f"• Total: <code>{total_gb:.2f} GB</code>\n"
-        f"• Used: <code>{used_gb:.2f} GB ({used_percent:.1f}%)</code>\n"
-        f"• Free: <code>{free_gb:.2f} GB</code>\n\n"
+        f"• Total: <code>{total_mb:.2f} MB ({total_mb/1024:.2f} GB)</code>\n"
+        f"• Used: <code>{used_mb:.2f} MB ({used_percent:.1f}%)</code>\n"
+        f"• Free: <code>{free_mb:.2f} MB ({free_mb/1024:.2f} GB)</code>\n\n"
         f"👥 <b>Bot Database Stats:</b>\n"
         f"• Total Users: <code>{total_users}</code>\n"
         f"• Active Source IDs: <code>{total_sources}</code>\n"
         f"• Active Forward IDs: <code>{total_dests}</code>"
     )
-    safe_send_message(message.chat.id, status_text, parse_mode="HTML")
+
+@bot.message_handler(commands=["status"])
+def status_command(message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    safe_send_message(message.chat.id, get_status_text(), parse_mode="HTML")
 
 @bot.message_handler(commands=["cancel"])
 def cancel(message):
@@ -296,6 +294,13 @@ def callback_handler(call):
             call.message.chat.id, channel_list_text(uid),
             parse_mode="HTML"
         )
+        return
+
+    if data == "admin_status":
+        bot.answer_callback_query(call.id)
+        if uid != ADMIN_ID:
+            return
+        safe_send_message(call.message.chat.id, get_status_text(), parse_mode="HTML")
         return
 
     if data in (
@@ -431,7 +436,7 @@ def process_id_action(message, action):
             f"• <code>{html.escape(x)}</code>" for x in failed
         ]
     safe_reply_to(message, "\n".join(lines), parse_mode="HTML")
-                    # =============== MEDIA / ALBUM HANDLING ===============
+        # =============== MEDIA / ALBUM HANDLING ===============
 CONTENT_TYPES = [
     "text", "photo", "video", "document", "audio",
     "animation", "voice", "video_note", "sticker",
@@ -723,4 +728,4 @@ if __name__ == "__main__":
         except Exception:
             logging.exception("Polling stopped; restarting in 5 seconds.")
             time.sleep(5)
-        
+            
