@@ -5,8 +5,11 @@ import html
 import sqlite3
 import logging
 import threading
+import requests
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import telebot
 from telebot.types import (
@@ -18,6 +21,7 @@ from telebot.types import (
 # =============== CONFIG ===============
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = 5989928539
+APP_URL = os.environ.get("APP_URL", "https://auto-forwardrr.onrender.com").strip().rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 DB_PATH = os.environ.get("DB_PATH", "users.db")
 
@@ -211,7 +215,6 @@ def start(message):
     )
 
 def get_status_text():
-    # SQLite Database File Size
     db_size_kb = 0
     if os.path.exists(DB_PATH):
         db_size_kb = os.path.getsize(DB_PATH) / 1024
@@ -343,8 +346,7 @@ def callback_handler(call):
         return
 
     bot.answer_callback_query(call.id, "Unknown option")
-
-# =============== ID PARSER ===============
+    # =============== ID PARSER ===============
 def parse_chat_ids(text):
     parts = [
         p for p in re.split(r"[\s,]+", (text or "").strip()) if p
@@ -696,6 +698,29 @@ def run_health_server():
     )
     server.serve_forever()
 
+# =============== SELF-PING EVERY 3 MINUTES ===============
+def start_self_ping():
+    session = requests.Session()
+    retry = Retry(
+        total=2, connect=2, read=2,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    def worker():
+        time.sleep(20)
+        while True:
+            try:
+                response = session.get(APP_URL + "/health", timeout=15)
+                response.close()
+            except requests.RequestException:
+                pass
+            time.sleep(180)
+
+    threading.Thread(target=worker, daemon=True, name="self-ping").start()
+
 # =============== START BOT ===============
 if __name__ == "__main__":
     init_db()
@@ -705,6 +730,7 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
+    start_self_ping()
     logging.warning("Auto Forward Bot started.")
 
     while True:
