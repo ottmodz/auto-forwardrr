@@ -2,6 +2,7 @@ import os
 import re
 import time
 import html
+import shutil
 import sqlite3
 import logging
 import threading
@@ -81,6 +82,43 @@ def get_all_users():
     finally:
         conn.close()
 
+# =============== AUTO DELETE HELPER ===============
+def safe_send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
+    """Sends a message and automatically deletes it after ~2 minutes (120 seconds)."""
+    try:
+        sent_msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        
+        def delete_later():
+            try:
+                bot.delete_message(chat_id, sent_msg.message_id)
+            except Exception:
+                pass
+
+        t = threading.Timer(120.0, delete_later)
+        t.daemon = True
+        t.start()
+        return sent_msg
+    except Exception:
+        return None
+
+def safe_reply_to(message, text, reply_markup=None, parse_mode="HTML"):
+    """Replies to a message and automatically deletes the reply after ~2 minutes (120 seconds)."""
+    try:
+        sent_msg = bot.reply_to(message, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        
+        def delete_later():
+            try:
+                bot.delete_message(message.chat.id, sent_msg.message_id)
+            except Exception:
+                pass
+
+        t = threading.Timer(120.0, delete_later)
+        t.daemon = True
+        t.start()
+        return sent_msg
+    except Exception:
+        return None
+
 # =============== CHANNEL HELPERS ===============
 def get_chats(table, user_id):
     store = sources if table == "sources" else destinations
@@ -105,7 +143,6 @@ def clear_pending(user_id):
         pending.pop(user_id, None)
 
 def is_id_registered(chat_id):
-    """Check if the ID is already registered globally by ANY user as a Source or Destination."""
     with state_lock:
         return (
             any(chat_id in x for x in sources.values())
@@ -113,12 +150,10 @@ def is_id_registered(chat_id):
         )
 
 def add_source(user_id, chat_id, title):
-    # Source IDs can be freely reused/added as sources by any user.
     with state_lock:
         sources.setdefault(user_id, {})[chat_id] = title or str(chat_id)
 
 def add_destination(user_id, chat_id, title):
-    # Any ID registered globally cannot be added as a destination.
     with state_lock:
         if is_id_registered(chat_id):
             return False
@@ -161,13 +196,13 @@ def manage_menu():
     )
     return kb
 
-# =============== START / CANCEL ===============
+# =============== START / STATUS / CANCEL ===============
 @bot.message_handler(commands=["start"])
 def start(message):
     if not message.from_user:
         return
     save_user(message.from_user)
-    bot.send_message(
+    safe_send_message(
         message.chat.id,
         "🤖 <b>Multi-User Auto Forward Bot</b>\n\n"
         "📥 Add Source Channel — receive posts from a source.\n"
@@ -179,10 +214,41 @@ def start(message):
         parse_mode="HTML",
     )
 
+@bot.message_handler(commands=["status"])
+def status_command(message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    
+    # Get Render / Disk Storage statistics
+    total, used, free = shutil.disk_usage("/")
+    
+    total_gb = total / (2**30)
+    used_gb = used / (2**30)
+    free_gb = free / (2**30)
+    used_percent = (used / total) * 100 if total > 0 else 0
+
+    with state_lock:
+        total_sources = sum(len(v) for v in sources.values())
+        total_dests = sum(len(v) for v in destinations.values())
+        total_users = len(get_all_users())
+
+    status_text = (
+        "📊 <b>Render Server & Bot Status</b>\n\n"
+        f"💾 <b>Disk Storage (Render):</b>\n"
+        f"• Total: <code>{total_gb:.2f} GB</code>\n"
+        f"• Used: <code>{used_gb:.2f} GB ({used_percent:.1f}%)</code>\n"
+        f"• Free: <code>{free_gb:.2f} GB</code>\n\n"
+        f"👥 <b>Bot Database Stats:</b>\n"
+        f"• Total Users: <code>{total_users}</code>\n"
+        f"• Active Source IDs: <code>{total_sources}</code>\n"
+        f"• Active Forward IDs: <code>{total_dests}</code>"
+    )
+    safe_send_message(message.chat.id, status_text, parse_mode="HTML")
+
 @bot.message_handler(commands=["cancel"])
 def cancel(message):
     clear_pending(message.from_user.id)
-    bot.reply_to(message, "❎ Cancelled.")
+    safe_reply_to(message, "❎ Cancelled.")
 
 def channel_list_text(user_id):
     src = get_chats("sources", user_id)
@@ -210,7 +276,7 @@ def callback_handler(call):
 
     if data == "home":
         bot.answer_callback_query(call.id)
-        bot.send_message(
+        safe_send_message(
             call.message.chat.id, "🏠 Main Menu",
             reply_markup=main_menu(uid)
         )
@@ -218,7 +284,7 @@ def callback_handler(call):
 
     if data == "manage":
         bot.answer_callback_query(call.id)
-        bot.send_message(
+        safe_send_message(
             call.message.chat.id, "⚙️ <b>Manage Channels</b>",
             reply_markup=manage_menu(), parse_mode="HTML"
         )
@@ -226,7 +292,7 @@ def callback_handler(call):
 
     if data == "mylist":
         bot.answer_callback_query(call.id)
-        bot.send_message(
+        safe_send_message(
             call.message.chat.id, channel_list_text(uid),
             parse_mode="HTML"
         )
@@ -262,7 +328,7 @@ def callback_handler(call):
                 "🗑 <b>Delete Forward Channel ID</b>\n\n"
                 "Send IDs separated by spaces or new lines. Cancel: /cancel",
         }
-        bot.send_message(
+        safe_send_message(
             call.message.chat.id, prompts[data], parse_mode="HTML"
         )
         return
@@ -270,10 +336,10 @@ def callback_handler(call):
     if data == "broadcast":
         bot.answer_callback_query(call.id)
         if uid != ADMIN_ID:
-            bot.send_message(call.message.chat.id, "⛔ Unauthorized.")
+            safe_send_message(call.message.chat.id, "⛔ Unauthorized.")
             return
         set_pending(uid, "broadcast")
-        bot.send_message(
+        safe_send_message(
             call.message.chat.id,
             "📣 <b>Admin Broadcast</b>\n\n"
             "Send text, photo, video, document, or supported media.\n"
@@ -315,7 +381,7 @@ def process_id_action(message, action):
     ids = parse_chat_ids(message.text)
 
     if not ids:
-        bot.reply_to(
+        safe_reply_to(
             message,
             "❌ Invalid format. Send numeric channel IDs separated by "
             "spaces or new lines.\n\nExample:\n"
@@ -364,8 +430,8 @@ def process_id_action(message, action):
         lines += ["", "❌ <b>Failed:</b>"] + [
             f"• <code>{html.escape(x)}</code>" for x in failed
         ]
-    bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
-                              # =============== MEDIA / ALBUM HANDLING ===============
+    safe_reply_to(message, "\n".join(lines), parse_mode="HTML")
+                    # =============== MEDIA / ALBUM HANDLING ===============
 CONTENT_TYPES = [
     "text", "photo", "video", "document", "audio",
     "animation", "voice", "video_note", "sticker",
@@ -437,7 +503,6 @@ def get_destinations_for_source(source_id):
     return result
 
 def forward_to_downstream(source_id, message_id):
-    """Automatically forward messages further if a destination channel is also used as a source by someone else."""
     downstream_destinations = set()
     with state_lock:
         for owner_id, chat_map in sources.items():
@@ -567,7 +632,7 @@ def broadcast_message(message):
             failed += 1
         time.sleep(0.04)
 
-    bot.send_message(
+    safe_send_message(
         message.chat.id,
         "📣 <b>Broadcast Complete</b>\n\n"
         f"✅ Sent: <code>{sent}</code>\n"
@@ -608,7 +673,7 @@ def handle_pending(message):
         "source_remove", "dest_remove"
     ):
         if message.content_type != "text":
-            bot.reply_to(
+            safe_reply_to(
                 message,
                 "❌ Please send channel IDs as text."
             )
@@ -658,3 +723,4 @@ if __name__ == "__main__":
         except Exception:
             logging.exception("Polling stopped; restarting in 5 seconds.")
             time.sleep(5)
+        
