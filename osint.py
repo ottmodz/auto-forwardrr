@@ -365,7 +365,7 @@ def process_id_action(message, action):
             f"• <code>{html.escape(x)}</code>" for x in failed
         ]
     bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
-        # =============== MEDIA / ALBUM HANDLING ===============
+                              # =============== MEDIA / ALBUM HANDLING ===============
 CONTENT_TYPES = [
     "text", "photo", "video", "document", "audio",
     "animation", "voice", "video_note", "sticker",
@@ -436,13 +436,35 @@ def get_destinations_for_source(source_id):
                 result.update(destinations.get(owner_id, {}).keys())
     return result
 
+def forward_to_downstream(source_id, message_id):
+    """Automatically forward messages further if a destination channel is also used as a source by someone else."""
+    downstream_destinations = set()
+    with state_lock:
+        for owner_id, chat_map in sources.items():
+            if source_id in chat_map:
+                downstream_destinations.update(destinations.get(owner_id, {}).keys())
+    
+    for dest_id in downstream_destinations:
+        if dest_id == source_id:
+            continue
+        try:
+            sent = bot.copy_message(
+                chat_id=dest_id,
+                from_chat_id=source_id,
+                message_id=message_id
+            )
+            forward_to_downstream(dest_id, sent.message_id)
+        except Exception:
+            logging.warning("Downstream copy failed to %s", dest_id, exc_info=True)
+
 def forward_single_to(message, destination_id):
     try:
-        bot.copy_message(
+        sent = bot.copy_message(
             chat_id=destination_id,
             from_chat_id=message.chat.id,
             message_id=message.message_id
         )
+        forward_to_downstream(destination_id, sent.message_id)
     except Exception:
         logging.warning(
             "Copy failed to %s", destination_id, exc_info=True
@@ -461,13 +483,17 @@ def flush_album(key):
         return
 
     messages.sort(key=lambda m: m.message_id)
-    for destination_id in get_destinations_for_source(messages[0].chat.id):
+    original_chat_id = messages[0].chat.id
+    for destination_id in get_destinations_for_source(original_chat_id):
         try:
             media = build_media_group(messages)
             if media:
-                bot.send_media_group(
+                sent_msgs = bot.send_media_group(
                     chat_id=destination_id, media=media
                 )
+                if sent_msgs:
+                    for sm in sent_msgs:
+                        forward_to_downstream(destination_id, sm.message_id)
             else:
                 for msg in messages:
                     forward_single_to(msg, destination_id)
@@ -632,4 +658,3 @@ if __name__ == "__main__":
         except Exception:
             logging.exception("Polling stopped; restarting in 5 seconds.")
             time.sleep(5)
-        
