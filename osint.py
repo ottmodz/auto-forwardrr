@@ -36,13 +36,10 @@ if not BOT_TOKEN:
 logging.basicConfig(level=logging.WARNING)
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=8)
 
-# Channel settings are RAM-only and reset after restart.
-sources = {}
-destinations = {}
 pending = {}
 state_lock = threading.RLock()
 
-# =============== USER DATABASE ===============
+# =============== USER & CHANNEL DATABASE ===============
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=20)
     conn.execute("PRAGMA busy_timeout=20000")
@@ -56,6 +53,22 @@ def init_db():
                 user_id INTEGER PRIMARY KEY,
                 first_name TEXT,
                 joined_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sources (
+                user_id INTEGER,
+                chat_id INTEGER,
+                title TEXT,
+                PRIMARY KEY (user_id, chat_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS destinations (
+                user_id INTEGER,
+                chat_id INTEGER,
+                title TEXT,
+                PRIMARY KEY (user_id, chat_id)
             )
         """)
         conn.commit()
@@ -120,16 +133,23 @@ def safe_reply_to(message, text, reply_markup=None, parse_mode="HTML"):
     except Exception:
         return None
 
-# =============== CHANNEL HELPERS ===============
+# =============== DB CHANNEL HELPERS ===============
 def get_chats(table, user_id):
-    store = sources if table == "sources" else destinations
-    with state_lock:
-        return list(store.get(user_id, {}).items())
+    conn = get_db()
+    try:
+        rows = conn.execute(f"SELECT chat_id, title FROM {table} WHERE user_id = ?", (user_id,)).fetchall()
+        return rows
+    finally:
+        conn.close()
 
 def remove_chat(table, user_id, chat_id):
-    store = sources if table == "sources" else destinations
-    with state_lock:
-        return store.get(user_id, {}).pop(chat_id, None) is not None
+    conn = get_db()
+    try:
+        cursor = conn.execute(f"DELETE FROM {table} WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
 
 def set_pending(user_id, action):
     with state_lock:
@@ -144,22 +164,62 @@ def clear_pending(user_id):
         pending.pop(user_id, None)
 
 def is_id_registered(chat_id):
-    with state_lock:
-        return (
-            any(chat_id in x for x in sources.values())
-            or any(chat_id in x for x in destinations.values())
-        )
+    conn = get_db()
+    try:
+        src = conn.execute("SELECT 1 FROM sources WHERE chat_id = ?", (chat_id,)).fetchone()
+        dst = conn.execute("SELECT 1 FROM destinations WHERE chat_id = ?", (chat_id,)).fetchone()
+        return src is not None or dst is not None
+    finally:
+        conn.close()
 
 def add_source(user_id, chat_id, title):
-    with state_lock:
-        sources.setdefault(user_id, {})[chat_id] = title or str(chat_id)
+    conn = get_db()
+    try:
+        conn.execute("""
+            INSERT INTO sources(user_id, chat_id, title)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, chat_id) DO UPDATE SET title=excluded.title
+        """, (user_id, chat_id, title or str(chat_id)))
+        conn.commit()
+    finally:
+        conn.close()
 
 def add_destination(user_id, chat_id, title):
-    with state_lock:
+    conn = get_db()
+    try:
         if is_id_registered(chat_id):
             return False
-        destinations.setdefault(user_id, {})[chat_id] = title or str(chat_id)
+        conn.execute("""
+            INSERT INTO destinations(user_id, chat_id, title)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, chat_id) DO UPDATE SET title=excluded.title
+        """, (user_id, chat_id, title or str(chat_id)))
+        conn.commit()
         return True
+    finally:
+        conn.close()
+
+def get_all_sources_map():
+    result = defaultdict(dict)
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT user_id, chat_id FROM sources").fetchall()
+        for owner_id, chat_id in rows:
+            result[owner_id][chat_id] = True
+        return result
+    finally:
+        conn.close()
+
+def get_all_destinations_map():
+    result = defaultdict(dict)
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT user_id, chat_id FROM destinations").fetchall()
+        for owner_id, chat_id in rows:
+            result[owner_id][chat_id] = True
+        return result
+    finally:
+        conn.close()
 
 # =============== MENUS ===============
 def main_menu(user_id):
@@ -180,18 +240,10 @@ def main_menu(user_id):
 def manage_menu():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
-        InlineKeyboardButton(
-            "➕ Add Source Channel ID", callback_data="source_add"
-        ),
-        InlineKeyboardButton(
-            "➕ Add Forward Channel ID", callback_data="dest_add"
-        ),
-        InlineKeyboardButton(
-            "🗑 Delete Source Channel ID", callback_data="source_remove"
-        ),
-        InlineKeyboardButton(
-            "🗑 Delete Forward Channel ID", callback_data="dest_remove"
-        ),
+        InlineKeyboardButton("➕ Add Source Channel ID", callback_data="source_add"),
+        InlineKeyboardButton("➕ Add Forward Channel ID", callback_data="dest_add"),
+        InlineKeyboardButton("🗑 Delete Source Channel ID", callback_data="source_remove"),
+        InlineKeyboardButton("🗑 Delete Forward Channel ID", callback_data="dest_remove"),
         InlineKeyboardButton("⬅️ Main Menu", callback_data="home"),
     )
     return kb
@@ -209,7 +261,7 @@ def start(message):
         "📤 Add Forward Channel — send copied posts to a destination.\n\n"
         "Use <b>Manage Channels</b> to add or remove channel IDs.\n"
         "Send multiple IDs separated by spaces or new lines.\n\n"
-        "⚠️ Channel settings reset after a bot restart.",
+        "💾 Channel IDs are saved permanently in database.",
         reply_markup=main_menu(message.from_user.id),
         parse_mode="HTML",
     )
@@ -438,6 +490,24 @@ album_buffer = defaultdict(list)
 album_timers = {}
 album_lock = threading.Lock()
 
+# Duplicate Prevention Cache (Tracks (source_chat_id, message_id))
+recent_messages = {}
+recent_lock = threading.Lock()
+
+def is_duplicate_message(source_chat_id, message_id):
+    key = (source_chat_id, message_id)
+    now = time.time()
+    with recent_lock:
+        # Cleanup old entries older than 60 seconds
+        expired_keys = [k for k, timestamp in recent_messages.items() if now - timestamp > 60]
+        for k in expired_keys:
+            recent_messages.pop(k, None)
+            
+        if key in recent_messages:
+            return True
+        recent_messages[key] = now
+        return False
+
 def media_kind(message):
     if message.content_type == "photo" and message.photo:
         return "photo", message.photo[-1].file_id
@@ -492,18 +562,25 @@ def build_media_group(messages):
 
 def get_destinations_for_source(source_id):
     result = set()
+    sources_map = get_all_sources_map()
+    dests_map = get_all_destinations_map()
     with state_lock:
-        for owner_id, chat_map in sources.items():
+        for owner_id, chat_map in sources_map.items():
             if source_id in chat_map:
-                result.update(destinations.get(owner_id, {}).keys())
+                result.update(dests_map.get(owner_id, {}).keys())
     return result
 
 def forward_to_downstream(source_id, message_id):
+    if is_duplicate_message(source_id, message_id):
+        return
+        
     downstream_destinations = set()
+    sources_map = get_all_sources_map()
+    dests_map = get_all_destinations_map()
     with state_lock:
-        for owner_id, chat_map in sources.items():
+        for owner_id, chat_map in sources_map.items():
             if source_id in chat_map:
-                downstream_destinations.update(destinations.get(owner_id, {}).keys())
+                downstream_destinations.update(dests_map.get(owner_id, {}).keys())
     
     for dest_id in downstream_destinations:
         if dest_id == source_id:
@@ -519,6 +596,8 @@ def forward_to_downstream(source_id, message_id):
             logging.warning("Downstream copy failed to %s", dest_id, exc_info=True)
 
 def forward_single_to(message, destination_id):
+    if is_duplicate_message(message.chat.id, message.message_id):
+        return
     try:
         sent = bot.copy_message(
             chat_id=destination_id,
@@ -545,6 +624,11 @@ def flush_album(key):
 
     messages.sort(key=lambda m: m.message_id)
     original_chat_id = messages[0].chat.id
+    
+    # Check duplicate for the album lead message
+    if is_duplicate_message(original_chat_id, messages[0].message_id):
+        return
+
     for destination_id in get_destinations_for_source(original_chat_id):
         try:
             media = build_media_group(messages)
@@ -607,9 +691,10 @@ def handle_group_post(message):
 # =============== ADMIN BROADCAST ===============
 def broadcast_message(message):
     targets = set(get_all_users())
+    dests_map = get_all_destinations_map()
 
     with state_lock:
-        for chat_map in destinations.values():
+        for chat_map in dests_map.values():
             targets.update(chat_map.keys())
 
     targets.discard(ADMIN_ID)
